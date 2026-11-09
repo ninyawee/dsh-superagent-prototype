@@ -172,8 +172,13 @@ export class Sessions {
     const model = await applyRoleModel(this.ctx, agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model, applied)
     if (model && !sameRoleModel(model, applied)) this.host.store.set(name, model)
   }
-  /** Records a turn that ended in an error, and clears it once a later turn of that session completes. */
+  /** Records a turn that ended in an error, and clears it once that session gets a model reply or a later turn completes. */
   private observeTurn(sessionId: string, event: { type: string; time: number; data: unknown }): void {
+    if (event.type === 'assistant/message') {
+      const source = (event.data as { message?: { source?: { kind?: string } } } | undefined)?.message?.source
+      if (source?.kind === 'model') this.turnErrors.delete(sessionId)
+      return
+    }
     if (event.type !== 'turn/end') return
     const reason = (event.data as { reason?: { kind?: string; error?: { message?: unknown } } } | undefined)?.reason
     if (reason?.kind === 'error') this.turnErrors.set(sessionId, { message: String(reason.error?.message ?? 'unknown error').slice(0, 300),
