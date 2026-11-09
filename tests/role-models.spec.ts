@@ -4,7 +4,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import { agentEvents, installModelSelection, type Agent, type ModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import { initializeRoleModel } from '../src/app/role-models.ts'
+import { applyRoleModel, initializeRoleModel } from '../src/app/role-models.ts'
 const contexts: Context[] = []
 afterEach(async () => { await Promise.all(contexts.splice(0).map(ctx => ctx.fiber.dispose())); vi.restoreAllMocks() })
 async function fixture() {
@@ -62,4 +62,35 @@ it('inherits the host when unset and fails unavailable routes before recording a
   resolve.mockRejectedValueOnce(new Error('unknown provider'))
   await expect(initializeRoleModel(ctx, agent, { provider: 'unknown', model: 'x' })).rejects.toThrow('unknown provider')
   expect(agent.session.snapshotEvents().some(event => event.type === 'model/selection')).toBe(false)
+})
+
+const selections = (agent: Agent) => agent.session.snapshotEvents().filter(event => event.type === 'model/selection').map(event => event.data)
+it('moves a Session that already ran to a newly configured role model', async () => {
+  const { ctx, agent, flush } = await fixture()
+  // A Session created on the host default keeps that route after its first request, however the default changes later.
+  agent.session.append('request/header', { header: { config: { provider: 'broken', model: 'flash' } }, reason: 'initial' })
+  const model = { provider: 'working', model: 'flash' }
+  expect(await applyRoleModel(ctx, agent, model, null)).toEqual(model)
+  expect(selections(agent)).toEqual([model])
+  expect(flush).toHaveBeenCalledOnce()
+})
+it('keeps a later manual selection until the configured role model changes', async () => {
+  const { ctx, agent, resolve } = await fixture()
+  const applied = { provider: 'working', model: 'flash' }
+  agent.session.append('request/header', { header: { config: applied }, reason: 'initial' })
+  agent.session.append('model/selection', { provider: 'manual', model: 'pro' })
+  expect(await applyRoleModel(ctx, agent, { ...applied }, applied)).toBe(applied)
+  expect(resolve).not.toHaveBeenCalled()
+  const changed = { provider: 'working', model: 'pro', reasoningEffort: 'high' }
+  expect(await applyRoleModel(ctx, agent, changed, applied)).toEqual(changed)
+  expect(selections(agent).at(-1)).toEqual(changed)
+})
+it('seeds a brand-new Session and leaves Sessions alone when no role model is set', async () => {
+  const { ctx, agent, request } = await fixture()
+  expect(await applyRoleModel(ctx, agent, null, null)).toBeNull()
+  expect(selections(agent)).toEqual([])
+  const model = { provider: 'worker', model: 'one' }
+  expect(await applyRoleModel(ctx, agent, model, null)).toEqual(model)
+  await ctx.systemPrompt.assemble()
+  expect(await request()).toEqual(model)
 })

@@ -13,9 +13,10 @@ import { AgentDelivery, messageId } from './delivery.ts'
 import type { Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
 import { RetryHealth } from './retry-health.ts'
-import { initializeRoleModel } from './role-models.ts'
+import { applyRoleModel, sameRoleModel } from './role-models.ts'
 import { bundledSkills } from './skill-files.ts'
 import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
+import type { Settings } from '../policy.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
 import type { RegisterTool, Tool } from './tools/tool.ts'
@@ -95,6 +96,8 @@ export class Sessions {
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
   private readonly retryHealth = new RetryHealth()
+  /** Managed sessions whose last turn ended in an error, such as a model route with no credential, until a turn completes. */
+  private readonly turnErrors = new Map<string, { message: string; at: string }>()
   private readonly ctx: Context
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
   constructor(private readonly host: SessionsHost) {
@@ -109,13 +112,14 @@ export class Sessions {
     const ctx = this.ctx
     ctx.on('agent/disposed', ({ agent }) => {
       this.release(agent)
-      this.retryHealth.clear(agent.id); this.updateModelHealth()
+      this.retryHealth.clear(agent.id); this.turnErrors.delete(agent.id); this.updateModelHealth()
     })
     ctx.on('session/event', (session, event) => {
       const agent = ctx.agents.get(session.id)
       const binding = agent && agent.session === session ? this.bindings.get(agent) : undefined
       if (!agent || !binding || binding.subagent) return
       this.retryHealth.observe(agent.id, event)
+      this.observeTurn(agent.id, event)
       this.updateModelHealth()
     })
     ctx.on('agent/created', async ({ agent }) => { await this.decorate(agent); return undefined })
@@ -146,12 +150,35 @@ export class Sessions {
       result = await ctx.sessionController.resolveAgent(id as SessionId)
     }
     if ('error' in result) throw result.error
-    const settings = this.host.store.settings()
-    await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
+    await this.applyRoleModel(result.agent, role, this.host.store.settings())
     await this.decorate(result.agent)
     ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
     return result.agent
+  }
+  /** Moves the main Session and loaded worker Sessions of live Tickets to their role's configured model after a settings save. */
+  async applyRoleModels(): Promise<void> {
+    const settings = this.host.store.settings()
+    const master = this.ctx.agents.get(this.host.masterId as SessionId)
+    if (master) await this.applyRoleModel(master, 'orchestrator', settings)
+    for (const [agent, binding] of this.bindings) {
+      const ticket = binding.subagent ? undefined : this.ticketOf(agent)
+      if (ticket && liveTicket(ticket)) await this.applyRoleModel(agent, 'worker', settings)
+    }
+  }
+  /** Applies `role`'s configured model to `agent` unless it is the one last applied there, and records what was applied. */
+  private async applyRoleModel(agent: Agent, role: 'orchestrator' | 'worker', settings: Settings): Promise<void> {
+    const name = KV.sessions.roleModel(agent.id), applied = this.host.store.get(name) ?? null
+    const model = await applyRoleModel(this.ctx, agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model, applied)
+    if (model && !sameRoleModel(model, applied)) this.host.store.set(name, model)
+  }
+  /** Records a turn that ended in an error, and clears it once a later turn of that session completes. */
+  private observeTurn(sessionId: string, event: { type: string; time: number; data: unknown }): void {
+    if (event.type !== 'turn/end') return
+    const reason = (event.data as { reason?: { kind?: string; error?: { message?: unknown } } } | undefined)?.reason
+    if (reason?.kind === 'error') this.turnErrors.set(sessionId, { message: String(reason.error?.message ?? 'unknown error').slice(0, 300),
+      at: new Date(event.time).toISOString() })
+    else if (reason?.kind === 'completed') this.turnErrors.delete(sessionId)
   }
   /** Returns whether `sessionId` already holds the message delivered under `requestId`, or `false` if the session does not exist. */
   async holds(sessionId: string, requestId: string): Promise<boolean> {
@@ -220,10 +247,13 @@ export class Sessions {
     return retry ? { model_retry: retry } : {}
   }
   private updateModelHealth(): void {
-    const retries = this.retryHealth.list()
-    this.host.health.set(retries.length
-      ? { state: 'error', detail: retries.slice(0, 5).map(item => `${item.sessionId}: ${item.provider} is over its model budget; retried ${item.attempts} times, waiting since ${item.since}; the model and retry policy are unchanged`).join('; ') + (retries.length > 5 ? `; ${retries.length - 5} more Sessions` : ''), at: retries.at(-1)!.lastAt }
-      : { state: 'ready', detail: 'No managed Session is waiting on a model budget retry' })
+    const problems = [
+      ...[...this.turnErrors].map(([sessionId, error]) => ({ detail: `${sessionId}: its last turn failed: ${error.message}`, at: error.at })),
+      ...this.retryHealth.list().map(item => ({ detail: `${item.sessionId}: ${item.provider} is over its model budget; retried ${item.attempts} times, waiting since ${item.since}; the model and retry policy are unchanged`, at: item.lastAt })),
+    ]
+    this.host.health.set(problems.length
+      ? { state: 'error', detail: problems.slice(0, 5).map(item => item.detail).join('; ') + (problems.length > 5 ? `; ${problems.length - 5} more Sessions` : ''), at: problems.at(-1)!.at }
+      : { state: 'ready', detail: 'No managed Session has a failed turn or is waiting on a model budget retry' })
   }
   private ticketOf(agent: Agent): Ticket | undefined {
     const ticketId = ticketOfSession(agent.id)

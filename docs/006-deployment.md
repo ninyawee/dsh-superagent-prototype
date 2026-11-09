@@ -23,7 +23,7 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 - Node.js 22.19+ or 24+, pnpm, git 2.32+, Python 3.8+ and tmux
 - GitHub CLI (`gh`) 2.48 or later. Source CLI fields must point to `gh` or `lark-cli` wrappers; the host relies on their subcommands and output formats.
 - A repository on github.com; GitHub Enterprise Server is not supported. To create a checkout per Ticket, keep a local clone from which the prepare command can add worktrees. Install `git-lfs` if that repository uses Git LFS.
-- A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
+- A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another. The `superagent` profile does not inherit the default model of the profile you work in: if that profile uses a provider other than DSH's built-in `deepseek-official`, such as `deepseek-account`, set the same `agent-default-model` entry in the `superagent` profile's `cordis.patch.yml`, or name the model in the Eval and Execution settings. A Session keeps the model of its first request, so a later change of the profile default does not move the main Session; a change of the Eval or Execution model does.
 - For Feishu: `lark-cli` (tested with 1.0.90) and a Feishu or Lark app with a bot
 
 ## Accounts
@@ -183,7 +183,7 @@ Health entries are grouped by responsibility:
 | Entry | Reports |
 | --- | --- |
 | `runtime` | The application itself |
-| `models` | Sessions waiting on a model-budget retry |
+| `models` | Sessions whose last turn failed, such as on a model with no credential, and Sessions waiting on a model-budget retry |
 | `evals` | Unavailable Evals from the last hour with no later judgement or dismissal |
 | `assessment`, `launch`, `delivery`, `relay`, `notice`, `reply` | Stored work described in [003 Execution](003-execution.md); delivery counts waiting work, while reply covers Channel messages |
 | `worker` | Executor Session event handling; appears after its first failure |
@@ -271,4 +271,5 @@ Setup problems appear on the overview with a link to the fix, in the panel's lan
 | `dsh-superagent configuration has keys it does not use` (log) | Remove the named keys; the message says where each value lives now |
 | The log says the plugin is incompatible with the running dsh | Install a DeepSeek Harness version within the `engines.dsh` range |
 | The panel shows "Failed to load plugins" after a DeepSeek Harness upgrade | Restart the running instance |
+| Evals end `unavailable` with `timeout`, and `models` reports `its last turn failed: … no API key for provider route …` | The main Session runs on a provider without a credential. Name a working model in the Eval settings, such as the one your own DeepSeek Harness profile uses; the main Session moves to it at once |
 | Nothing happens after a mention | Check that the author is on the Source's allowed list, the Source is on, and processing is not paused. On GitHub, a mention added by editing an Issue's body is not received; mention the agent in a comment |
